@@ -362,18 +362,31 @@ def compute_step_change_features(
 
     Notes
     -----
-    In v1, "extreme" is based on a fixed threshold from config.
-    Later, you can swap this for robust-sigma thresholding.
+    Step detection operates in mm/day space: raw consecutive differences are
+    divided by the elapsed time between observations before any threshold
+    comparison.  ``neg_delta_mean_threshold_mm`` in the config is therefore a
+    rate threshold (mm/day), not an absolute magnitude.  The output columns
+    ``neg_delta_mean_mm`` and ``neg_delta_std_mm`` store mm/day values; the
+    names are preserved for downstream compatibility.
+
+    Pairs whose timestamps are identical (dt == 0) are floored to 1 minute so
+    that a same-timestamp drop produces a finite (very large negative) rate
+    rather than a division-by-zero.
     """
     records: List[Dict[str, Any]] = []
 
-    threshold_mm = float(config["neg_delta_mean_threshold_mm"])
+    threshold_mm = float(config["neg_delta_mean_threshold_mm"])  # now mm/day
     min_negative_events = int(config["min_negative_events"])
+
+    _MIN_GAP_DAYS = 1.0 / 1440.0  # floor: 1 minute in days
 
     for station_id, g in df.groupby(station_col, sort=False):
         g = g.sort_values(time_col).copy()
-    
+
         vals = g[value_col].to_numpy(dtype=float)
+        times_ns = pd.to_datetime(g[time_col]).to_numpy(
+            dtype="datetime64[ns]"
+        ).astype(np.int64)
 
         if len(vals) < 2:
             records.append(
@@ -392,10 +405,16 @@ def compute_step_change_features(
             continue
 
         deltas = np.diff(vals)
-        n_step_events = len(deltas)
+        time_gaps_days = np.maximum(
+            np.diff(times_ns) / 1e9 / 86400.0,
+            _MIN_GAP_DAYS,
+        )
+        rates = deltas / time_gaps_days  # mm/day
 
-        neg_deltas = deltas[deltas < 0]
-        n_negative_step_events = len(neg_deltas)
+        n_step_events = len(rates)
+
+        neg_rates = rates[rates < 0]
+        n_negative_step_events = len(neg_rates)
 
         if n_negative_step_events == 0:
             n_extreme = 0
@@ -404,11 +423,11 @@ def compute_step_change_features(
             neg_delta_mean_mm = 0.0
             neg_delta_std_mm = 0.0
         else:
-            n_extreme = int(np.sum(neg_deltas <= threshold_mm))
+            n_extreme = int(np.sum(neg_rates <= threshold_mm))
             pct_extreme_negative_steps = _safe_divide(n_extreme, n_negative_step_events)
             pct_extreme_negative_steps_of_all = _safe_divide(n_extreme, n_step_events)
-            neg_delta_mean_mm = float(np.mean(neg_deltas))
-            neg_delta_std_mm = float(np.std(neg_deltas))
+            neg_delta_mean_mm = float(np.mean(neg_rates))
+            neg_delta_std_mm = float(np.std(neg_rates))
 
         score_pct_extreme = _normalize_against_threshold(
             pct_extreme_negative_steps,
@@ -446,6 +465,7 @@ def compute_step_change_features(
         )
 
     return pd.DataFrame(records)
+
 
 # ============================================================
 # CADENCE FEATURES
